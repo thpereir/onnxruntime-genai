@@ -16,6 +16,7 @@ ONNX Runtime's format no matter where the quantized weights actually come from.
 
 import os
 import re
+import json
 
 import torch
 from safetensors.torch import load_file
@@ -227,6 +228,13 @@ class QuantizedModel:
         self.lm_head = TensorModule()
         self.layers = {}
         self.num_layers = num_layers
+        self.q_size = q_size
+        self.kv_size = kv_size
+        self.intermediate_size = intermediate_size
+        # Factored online rotation (Quark rotation algo): x_rot = (x / input_prescale) @ shared_input_rotation_<in>.
+        # `shared_input_rotations` maps in_features -> [in, in] rotation matrix (shared across all layers).
+        self.input_path = input_path
+        self.shared_input_rotations = {}
         self._quant_attrs = quant_attrs
         self._load_quant_config(quant_attrs)
 
@@ -274,6 +282,10 @@ class QuantizedModel:
                         # transformer.rotary_pos_emb.inv_freq in ChatGLM3.
                         # Skip rotary embedding weights since they can be re-calculated when looping through the model
                         continue
+                    elif name.startswith("shared_input_rotation_"):
+                        # Model-level shared input-rotation matrix keyed by in_features (Quark factored rotation).
+                        in_features = int(name.rsplit("_", 1)[1])
+                        self.shared_input_rotations[in_features] = tensor
                     else:
                         if name.startswith("transformer.encoder"):
                             # Chatglm3, e.g., transformer.encoder.layers.0.input_layernorm.weight
@@ -664,6 +676,21 @@ class QuantizedModel:
                         elif bool(re.match(r"^model.layers\.\d+\.self_attn\.sinks$", name)):
                             # model.layers.layer_id.self_attn.sinks
                             tensor_map["self_attn.sinks"] = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.(self_attn.qkv_proj|self_attention.query_key_value)\.input_prescale$", name)):
+                            # Factored-rotation per-input scale, shared by the q/k/v splits (same input).
+                            tensor_map["self_attn.q_proj.input_prescale"] = tensor
+                            tensor_map["self_attn.k_proj.input_prescale"] = tensor
+                            tensor_map["self_attn.v_proj.input_prescale"] = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.input_prescale$", name)):
+                            tensor_map["self_attn." + name.split(".")[-2] + ".input_prescale"] = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_up_proj|dense_h_to_4h)\.input_prescale$", name)):
+                            # Shared by the gate/up splits (same input).
+                            tensor_map["mlp.gate_proj.input_prescale"] = tensor
+                            tensor_map["mlp.up_proj.input_prescale"] = tensor
+                        elif bool(re.match(r"^model.layers\.\d+\.mlp.(gate_proj|up_proj|down_proj|dense_4h_to_h)\.input_prescale$", name)):
+                            leaf = name.split(".")[-2]
+                            leaf = "down_proj" if leaf == "dense_4h_to_h" else leaf
+                            tensor_map["mlp." + leaf + ".input_prescale"] = tensor
                         else:
                             raise NotImplementedError(f"{name} in your quantized model is not recognized.")
 
@@ -696,6 +723,80 @@ class QuantizedModel:
 
         # Set properties of each layer based on quantization type
         self.set_properties()
+
+        # Bake additive PEFT LoRA adapters into the projections (if present).
+        self._load_lora_adapters()
+
+    def _load_lora_adapters(self):
+        """Attach PEFT LoRA adapters (baked additively into the graph) if present.
+
+        The adapter lives at ``<input_path>/lora_adapters/adapter_model.safetensors``
+        with keys ``base_model.model.model.layers.{i}.{proj}.lora_A.weight`` [r, in]
+        and ``.lora_B.weight`` [out, r] for proj in {qkv_proj, o_proj, gate_up_proj,
+        down_proj}. ``lora_A`` is shared across split projections that share an input
+        (q/k/v share the qkv input, gate/up share the gate_up input); ``lora_B`` is
+        split along its output dimension. The builder emits the runtime delta
+        ``(lora_B @ lora_A @ x) * scaling`` added to the quantized projection output.
+        """
+        adapter_dir = os.path.join(self.input_path, "lora_adapters")
+        adapter_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+        if not os.path.exists(adapter_path):
+            return
+
+        scaling = 1.0
+        config_path = os.path.join(adapter_dir, "adapter_config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as config_file:
+                adapter_config = json.load(config_file)
+            rank = adapter_config.get("r")
+            alpha = adapter_config.get("lora_alpha")
+            if rank:
+                scaling = alpha / (rank ** 0.5) if adapter_config.get("use_rslora", False) else alpha / rank
+
+        weights = load_file(adapter_path)
+        layers_by_id = {layer.layer_id: layer for layer in self.layers}
+
+        for name, tensor in weights.items():
+            match = re.match(
+                r"^base_model\.model\.model\.layers\.(\d+)\."
+                r"(self_attn\.qkv_proj|self_attn\.o_proj|mlp\.gate_up_proj|mlp\.down_proj)\."
+                r"(lora_A|lora_B)\.weight$",
+                name,
+            )
+            if match is None:
+                raise NotImplementedError(f"{name} in the LoRA adapter is not recognized.")
+            layer_id, proj, ab = int(match.group(1)), match.group(2), match.group(3)
+            layer = layers_by_id.get(layer_id)
+            if layer is None:
+                continue
+
+            # Map the (fused) adapter projection to the builder's split modules.
+            if proj == "self_attn.qkv_proj":
+                targets = [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]
+                out_splits = [self.q_size, self.kv_size, self.kv_size]
+            elif proj == "self_attn.o_proj":
+                targets, out_splits = [layer.self_attn.o_proj], None
+            elif proj == "mlp.gate_up_proj":
+                targets = [layer.mlp.gate_proj, layer.mlp.up_proj]
+                out_splits = [self.intermediate_size, self.intermediate_size]
+            else:  # mlp.down_proj
+                targets, out_splits = [layer.mlp.down_proj], None
+
+            if ab == "lora_A":
+                # Shared input projection: every split target uses the same lora_A.
+                for target in targets:
+                    target.lora_A = tensor
+                    target.lora_scaling = scaling
+            elif out_splits is None:
+                targets[0].lora_B = tensor
+                targets[0].lora_scaling = scaling
+            else:
+                # lora_B is split along its output dimension across the targets.
+                start = 0
+                for target, size in zip(targets, out_splits):
+                    target.lora_B = tensor[start : start + size, :]
+                    target.lora_scaling = scaling
+                    start += size
 
     # Canonical name mapping for lm_head tensors (transformer.output_layer.* -> lm_head.*)
     _LM_HEAD_NAME_MAP = {

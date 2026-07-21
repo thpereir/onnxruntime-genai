@@ -1168,7 +1168,57 @@ class Model:
             # For regular `MatMul`
             return self.make_matmul_op(matmul, basename, root_input, **kwargs)
 
+    def make_factored_rotation(self, matmul, basename, root_input, **kwargs):
+        """Emit the factored online input rotation for a projection:
+
+            x_rot = (x * input_prescale) @ shared_input_rotation_<in>
+
+        `input_prescale` is a per-projection [in] vector (small, emitted per projection).
+        `shared_input_rotation_<in>` is a single [in, in] matrix shared by every projection
+        of the same in_features and emitted only once (a huge size saving vs. inlining a copy
+        per projection). Returns the rotated activation tensor name to feed into MatMulNBits.
+        """
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        in_features = matmul.in_features
+
+        # 1. Multiply by the per-projection input pre-scale vector.
+        prescale_init = basename[1:].replace("/", ".") + ".input_prescale"
+        self.make_initializer(matmul.input_prescale, prescale_init, to=self.io_dtype)
+        div_output = f"{basename}/input_prescale/output_0"
+        self.make_node("Mul", inputs=[root_input, prescale_init], outputs=[div_output], name=f"{basename}/input_prescale")
+        self.make_value(div_output, self.io_dtype, shape=["batch_size", seq_dim, in_features])
+
+        # 2. Multiply by the shared rotation matrix (single initializer per in_features).
+        rot_init = f"model.shared_input_rotation_{in_features}"
+        if rot_init not in self.shared_rotation_initializers:
+            self.make_initializer(self.shared_input_rotations[in_features], rot_init, to=self.io_dtype)
+            self.shared_rotation_initializers.add(rot_init)
+        rot_output = f"{basename}/shared_input_rotation/output_0"
+        self.make_node("MatMul", inputs=[div_output, rot_init], outputs=[rot_output], name=f"{basename}/shared_input_rotation")
+        self.make_value(rot_output, self.io_dtype, shape=["batch_size", seq_dim, in_features])
+        return rot_output
+
     def make_matmul_op(self, matmul, basename, root_input, **kwargs):
+        # Factored online rotation (Quark rotation algo): rotate the activation before the
+        # quantized projection. Weights are stored in the rotated basis, so this is required.
+        # LoRA (below) is applied to the ORIGINAL (pre-rotation) activation, so capture it first.
+        original_root_input = root_input
+        if getattr(matmul, "input_prescale", None) is not None and getattr(self, "shared_input_rotations", None):
+            root_input = self.make_factored_rotation(matmul, basename, root_input, **kwargs)
+
+        matmul_name = self.make_matmul_core(matmul, basename, root_input, **kwargs)
+
+        # Bake the additive PEFT LoRA delta into the graph, if present (never for `logits`,
+        # since the excluded lm_head carries no adapter).
+        if (
+            not kwargs.get("logits", False)
+            and getattr(matmul, "lora_A", None) is not None
+            and getattr(matmul, "lora_B", None) is not None
+        ):
+            return self.make_lora_add(matmul, basename, original_root_input, matmul_name, **kwargs)
+        return matmul_name
+
+    def make_matmul_core(self, matmul, basename, root_input, **kwargs):
         # 2-bit Quark weights are emitted as MatMulNBits even when the io/onnx dtype is
         # float (ORT runs the float zero-point 2-bit MatMulNBits on CPU/MLAS).
         if hasattr(matmul, "qweight") and matmul.qweight is not None and getattr(matmul, "bits", None) == 2:
@@ -1182,6 +1232,32 @@ class Model:
                 return self.make_matmul_int4(matmul, basename, root_input, **kwargs)
         else:
             raise NotImplementedError(f"The {self.onnx_dtype} precision is not currently supported.")
+
+    def make_lora_add(self, matmul, basename, root_input, matmul_name, **kwargs):
+        # Additive PEFT LoRA delta, baked into the graph:
+        #     y = MatMulNBits(rotate(x)) + ((x @ lora_A^T) @ (scaling * lora_B)^T)
+        # lora_A is [rank, in_features], lora_B is [out_features, rank]; both act on the
+        # ORIGINAL (pre-rotation) activation, matching how the adapter was trained. The
+        # `scaling` factor (lora_alpha / r) is pre-baked into the lora_B initializer.
+        seq_dim = kwargs.get("seq_dim", "sequence_length")
+        rank = matmul.lora_A.shape[0]
+        out_features = matmul.lora_B.shape[0]
+
+        lora_A_weight = f"{basename}/lora_A/weight"
+        self.make_initializer(matmul.lora_A.T, lora_A_weight, to=self.io_dtype)
+        lora_A_output = f"{basename}/lora_A/output_0"
+        self.make_node("MatMul", inputs=[root_input, lora_A_weight], outputs=[lora_A_output], name=f"{basename}/lora_A")
+        self.make_value(lora_A_output, self.io_dtype, shape=["batch_size", seq_dim, rank])
+
+        lora_B_weight = f"{basename}/lora_B/weight"
+        self.make_initializer((matmul.lora_B * matmul.lora_scaling).T, lora_B_weight, to=self.io_dtype)
+        lora_B_output = f"{basename}/lora_B/output_0"
+        self.make_node("MatMul", inputs=[lora_A_output, lora_B_weight], outputs=[lora_B_output], name=f"{basename}/lora_B")
+        self.make_value(lora_B_output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
+
+        add_name = f"{basename}/lora/Add"
+        self.make_add(add_name, [f"{matmul_name}/output_0", lora_B_output], dtype=self.io_dtype, shape=["batch_size", seq_dim, out_features])
+        return add_name
 
     def make_matmul_float(self, matmul, name, root_input, **kwargs):
         weight = name[1:].replace("/", ".") + ".weight"
@@ -3747,6 +3823,13 @@ class Model:
                 intermediate_size=self.intermediate_size,
                 num_layers=self.num_layers,
             )
+            # Factored online rotation (Quark rotation algo): shared [in, in] rotation
+            # matrices, emitted once and referenced by every projection of that in_features.
+            self.shared_input_rotations = getattr(model, "shared_input_rotations", {}) or {}
+            self.shared_rotation_initializers = set()
+            if self.shared_input_rotations:
+                # Each projection applies its own input rotation, so build q/k/v separately.
+                self.attention_attrs["use_packed_matmul"] = False
 
         else:
             extra_kwargs = {"num_hidden_layers": self.num_layers} if "num_hidden_layers" in self.extra_options else {}

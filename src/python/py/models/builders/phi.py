@@ -569,6 +569,49 @@ class Phi3MoELongRoPEModel(MistralModel):
             self.layernorm_attrs["last_layernorm"] = True
 
 
+class Phi4LoraKDModel(Phi3MiniModel):
+    """Builder for phi-4 lora-kd-linear models (Phi3DenseLoraForCausalLM).
+
+    These models use SRHTAWQDenseLinearWithLoRA modules where each projection is:
+        y = MatMulNBits(MatMul(x, pre_linear), W_2bit) + MatMul(MatMul(x, lora_A), lora_B) * scaling
+
+    The model is loaded with trust_remote_code=True to get the custom module classes.
+    The fused qkv_proj and gate_up_proj are split by make_attention_unpacked_lora_kd
+    and make_mlp_unpacked_lora_kd in base.py, and each split projection is then
+    handled by make_matmul_lora_kd.
+    """
+
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        # Disable packed QKV matmul since we split the fused qkv_proj into separate q/k/v
+        self.attention_attrs["use_packed_matmul"] = False
+
+
+class Phi4FactoredLoraKDModel(Phi4LoraKDModel):
+    """Builder for phi-4 factored lora-kd-linear models (Phi3FactoredLoraForCausalLM).
+
+    Identical to Phi4LoraKDModel except the per-projection dense `pre_linear` matrix
+    is replaced by a factored form:
+        pre_linear(x) = (x / awq_s_vec) @ shared_R_<in>
+    where each `shared_R_<in>` is a single rotation matrix shared by every projection
+    with the same `in_features` (only 2 unique sizes for Phi-4: 5120 and 17920). The
+    rotation is emitted once as a shared initializer and referenced by all projections,
+    avoiding the per-projection [in, in] blow-up of the dense export.
+
+    Each projection becomes:
+        y = MatMulNBits(MatMul(Div(x, awq_s_vec), shared_R), W_2bit)
+            + MatMul(MatMul(x, lora_A), lora_B) * scaling
+    """
+
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        # Signal to base.py emit/split helpers to use the factored pre_linear path
+        self.is_factored_lora_kd = True
+        # Track which shared rotation initializers have already been emitted so each
+        # is registered exactly once and referenced by all projections that share it.
+        self.shared_rotation_initializers = set()
+
+
 class Phi4MMModel(Phi3VModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)

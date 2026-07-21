@@ -25,6 +25,47 @@ class QwenModel(Model):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
 
+class Qwen2LoraKDModel(QwenModel):
+    """Builder for Qwen2/QwQ lora-kd-linear models (Qwen2DenseLoraForCausalLM).
+
+    Mirror of Phi4LoraKDModel for the Qwen2 architecture. Each projection is a
+    SRHTAWQDenseLinearWithLoRA module:
+        y = MatMulNBits(MatMul(x, pre_linear), W_2bit) + MatMul(MatMul(x, lora_A), lora_B) * scaling
+    Unlike Phi-4 these models keep q/k/v/gate/up projections separate (not fused)
+    and q/k/v carry a bias, both of which are handled by the standard separate-MatMul
+    path in base.py once `use_packed_matmul` is disabled.
+    """
+
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        # Projections are individual lora-kd modules, so emit a separate MatMul per Q/K/V.
+        self.attention_attrs["use_packed_matmul"] = False
+
+
+class Qwen2FactoredLoraKDModel(Qwen2LoraKDModel):
+    """Builder for Qwen2/QwQ factored lora-kd-linear models (Qwen2FactoredLoraForCausalLM).
+
+    Mirror of Phi4FactoredLoraKDModel for the Qwen2 architecture. The per-projection
+    dense `pre_linear` matrix is replaced by a factored form:
+        pre_linear(x) = (x / awq_s_vec) @ shared_R_<in>
+    where each `shared_R_<in>` is a single rotation matrix shared by every projection
+    with the same `in_features` (only 2 unique sizes for QwQ-32B: 5120 and 27648),
+    emitted once as a shared initializer and referenced by all projections.
+
+    Each projection becomes:
+        y = MatMulNBits(MatMul(Div(x, awq_s_vec), shared_R), W_2bit)
+            + MatMul(MatMul(x, lora_A), lora_B) * scaling   (+ bias for q/k/v)
+    """
+
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+        # Signal to base.py emit/split helpers to use the factored pre_linear path.
+        self.is_factored_lora_kd = True
+        # Track which shared rotation initializers have already been emitted so each
+        # is registered exactly once and referenced by all projections that share it.
+        self.shared_rotation_initializers = set()
+
+
 class Qwen3Model(QwenModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)

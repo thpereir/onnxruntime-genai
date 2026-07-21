@@ -26,10 +26,22 @@ from .phi import (
     Phi3SmallLongRoPEModel,
     Phi3SmallModel,
     Phi3VModel,
+    Phi4FactoredLoraKDModel,
+    Phi4LoraKDModel,
     Phi4MMModel,
     PhiModel,
 )
-from .qwen import Qwen3Model, Qwen25VLTextModel, Qwen3VLTextModel, Qwen35TextModel, Qwen35MoeTextModel, QwenModel, VideoChatFlashQwenModel
+from .qwen import (
+    Qwen2FactoredLoraKDModel,
+    Qwen2LoraKDModel,
+    Qwen3Model,
+    Qwen25VLTextModel,
+    Qwen3VLTextModel,
+    Qwen35TextModel,
+    Qwen35MoeTextModel,
+    QwenModel,
+    VideoChatFlashQwenModel,
+)
 from .smollm import SmolLM3Model
 from .whisper import WhisperModel
 
@@ -56,8 +68,12 @@ __all__ = [
     "Phi3SmallLongRoPEModel",
     "Phi3SmallModel",
     "Phi3VModel",
+    "Phi4FactoredLoraKDModel",
+    "Phi4LoraKDModel",
     "Phi4MMModel",
     "PhiModel",
+    "Qwen2FactoredLoraKDModel",
+    "Qwen2LoraKDModel",
     "Qwen3Model",
     "Qwen3VLTextModel",
     "Qwen25VLTextModel",

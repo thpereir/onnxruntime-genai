@@ -40,8 +40,12 @@ from builders import (
     Phi3SmallLongRoPEModel,
     Phi3SmallModel,
     Phi3VModel,
+    Phi4FactoredLoraKDModel,
+    Phi4LoraKDModel,
     Phi4MMModel,
     PhiModel,
+    Qwen2FactoredLoraKDModel,
+    Qwen2LoraKDModel,
     Qwen3Model,
     Qwen3VLTextModel,
     Qwen25VLTextModel,
@@ -302,12 +306,20 @@ def create_model(
         print("WARNING: This is only generating the text component of the model. Setting `--extra_options exclude_embeds=true` by default.")
         extra_options["exclude_embeds"] = True
         onnx_model = Phi3VModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "Phi3DenseLoraForCausalLM":
+        onnx_model = Phi4LoraKDModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "Phi3FactoredLoraForCausalLM":
+        onnx_model = Phi4FactoredLoraKDModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "Phi4MMForCausalLM":
         print("WARNING: This is only generating the text component of the model. Setting `--extra_options exclude_embeds=true` by default.")
         extra_options["exclude_embeds"] = True
         onnx_model = Phi4MMModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "Qwen2ForCausalLM":
         onnx_model = QwenModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "Qwen2DenseLoraForCausalLM":
+        onnx_model = Qwen2LoraKDModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "Qwen2FactoredLoraForCausalLM":
+        onnx_model = Qwen2FactoredLoraKDModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "VideoChatFlashQwenForCausalLM":
         print("WARNING: This is only generating the text component of the model. Setting `--extra_options exclude_embeds=true` by default.")
         extra_options["exclude_embeds"] = True
