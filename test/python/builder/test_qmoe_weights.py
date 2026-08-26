@@ -156,7 +156,7 @@ def _load_builder_cli_module(monkeypatch):
         "Gemma2Model",
         "Gemma3Model",
         "Gemma4MoEModel",
-        "Gemma4Model",
+        "Gemma4UnifiedModel",
         "GemmaModel",
         "GPTOSSModel",
         "GraniteMoEHybridModel",

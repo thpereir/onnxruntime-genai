@@ -3,7 +3,7 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-"""Unit tests for the Gemma4Model builder (gemma4-12b-it text component).
+"""Unit tests for the Gemma4UnifiedModel builder (gemma4-12b-it text component).
 
 These exercise the builder's structural deviations from Gemma3 without loading
 weights or running the full pipeline:
@@ -31,7 +31,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src", "python", "py"))
 
-from models.builders.gemma import Gemma4Model
+from models.builders.gemma import Gemma4UnifiedModel
 
 # 6-layer synthetic config: 5 sliding + 1 full, mirroring the gemma4 pattern.
 LAYER_TYPES = ["sliding_attention"] * 5 + ["full_attention"] + ["sliding_attention"] * 4
@@ -105,7 +105,7 @@ def _hf_default_cos_sin(head_dim, base, cache_length):
 class TestGemma4Model:
     def _make_model(self, **overrides):
         cfg = _make_minimal_config(**overrides)
-        return Gemma4Model(
+        return Gemma4UnifiedModel(
             cfg,
             io_dtype=ir.DataType.FLOAT,
             onnx_dtype=ir.DataType.FLOAT,

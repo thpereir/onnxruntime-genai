@@ -11,7 +11,7 @@ from .bailing_vl import BailingVLModel
 from .base import Model
 from .chatglm import ChatGLMModel
 from .ernie import ErnieModel
-from .gemma import Gemma2Model, Gemma3Model, Gemma4Model, Gemma4MoEModel, GemmaModel
+from .gemma import Gemma2Model, Gemma3Model, Gemma4MoEModel, Gemma4UnifiedModel, GemmaModel
 from .gptoss import GPTOSSModel
 from .granite import GraniteModel, GraniteMoEHybridModel
 from .hunyuan import HunyuanDenseV1Model
@@ -68,7 +68,7 @@ __all__ = [
     "Gemma2Model",
     "Gemma3Model",
     "Gemma4MoEModel",
-    "Gemma4Model",
+    "Gemma4UnifiedModel",
     "GemmaModel",
     "GraniteMoEHybridModel",
     "GraniteModel",

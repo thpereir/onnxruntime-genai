@@ -186,7 +186,7 @@ class Gemma3Model(Gemma2Model):
         return super().make_rotary_embedding_caches(cos_cache_name=cos_cache_name, sin_cache_name=sin_cache_name)
 
 
-class Gemma4Model(Gemma3Model):
+class Gemma4UnifiedModel(Gemma3Model):
     """Builder for the text decoder of Gemma4Unified (gemma4-12b-it).
 
     Differs from Gemma3 in several structural ways (see below). Only the text
@@ -467,11 +467,11 @@ class Gemma4Model(Gemma3Model):
             self.layernorm_attrs[attr] = f"{mul_name}/output_0"
 
 
-class Gemma4MoEModel(Gemma4Model):
+class Gemma4MoEModel(Gemma4UnifiedModel):
     """Builder for the text decoder of Gemma4 MoE (gemma-4-26B-A4B-it).
 
     Inherits the entire attention / RoPE / per-layer-KV / layer_scalar stack from
-    the dense `Gemma4Model`. The only structural difference is the FFN: every layer
+    the dense `Gemma4UnifiedModel`. The only structural difference is the FFN: every layer
     runs a dense MLP AND a top-k expert MoE block in parallel, then sums them:
 
         residual = hidden                         # after attention + post_attn norm
@@ -536,10 +536,10 @@ class Gemma4MoEModel(Gemma4Model):
         # Same text-only remap as the dense model, but the MoE checkpoint is a
         # `Gemma4ForConditionalGeneration` whose text tower is `Gemma4ForCausalLM`.
         if self.quant_type is not None or input_path.endswith(".gguf"):
-            # Deliberately skip Gemma4Model.load_weights (the dense text-only
+            # Deliberately skip Gemma4UnifiedModel.load_weights (the dense text-only
             # remap) and use the generic base loader for quantized/GGUF inputs.
             # Called explicitly rather than via super() because super() would
-            # resolve to Gemma4Model.load_weights and change behavior.
+            # resolve to Gemma4UnifiedModel.load_weights and change behavior.
             return Model.load_weights(self, input_path)
 
         # Version-gated: only transformers builds that ship the Gemma4 MoE model expose this.
