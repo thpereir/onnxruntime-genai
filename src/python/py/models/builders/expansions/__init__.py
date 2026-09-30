@@ -4,12 +4,14 @@
 # license information.
 # -------------------------------------------------------------------------
 from .dml import DML
+from .quark import Quark
 from .standard import Standard
 from .trt_rtx import TRT_RTX
 from .webgpu import WebGPU
 
 __all__ = [
     "DML",
+    "Quark",
     "TRT_RTX",
     "Standard",
     "WebGPU",
