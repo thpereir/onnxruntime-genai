@@ -71,7 +71,7 @@ class QuarkModel(QuantizedModel):
         # Pre-quantized 2-bit split experts (Gemma4 factored uint2 checkpoint): consume the
         # group-wise uint2 weights/scales/float zero-points directly and re-fuse gate|up as a
         # CONCAT block. The per-expert prescale and per_expert_scale are folded in the builder's
-        # make_moe_quark_preprocessing, so the native QMoE attrs (finalize_packed_experts) are not
+        # the Quark expansion's make_moe_preprocessing, so the native QMoE attrs (finalize_packed_experts) are not
         # used here.
         first = next(iter(experts.values()))
         is_2bit = first.gate_proj is not None and first.gate_proj.bits == 2
@@ -201,7 +201,7 @@ class QuarkModel(QuantizedModel):
         Output (native Gemma4 fused orientation, gate block then up block):
           fc1_weights (E, 2*inter, hidden/pack) packed uint8; fc1_scales/zp (E, 2*inter, n_groups_h)
           fc2_weights (E, hidden, inter/pack) packed uint8; fc2_scales/zp (E, hidden, n_groups_i)
-        per_expert_scale is folded into fc2_scales later in make_moe_quark_preprocessing.
+        per_expert_scale is folded into fc2_scales later in the Quark expansion's make_moe_preprocessing.
         """
         fc1_w, fc1_s, fc1_z, fc2_w, fc2_s, fc2_z = [], [], [], [], [], []
         for expert_id in sorted(experts.keys()):
