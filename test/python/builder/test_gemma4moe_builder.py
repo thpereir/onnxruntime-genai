@@ -275,13 +275,13 @@ class TestGemma4MoEQuarkInt4Path:
         m = _make_model(onnx_dtype=ir.DataType.FLOAT)
         m.quant_type = "quark"
         m.ep = ep
+        m.quant_attrs["config"] = {"global_quant_config": {"weight": {"group_size": group_size}}}
         # Bind the Quark expansion methods (real construction does this via
-        # make_quant_expansions_init once quant_type is known).
-        m.make_quant_expansions_init()
+        # make_quant_expansions_init once quant_type is known). Plain Quark/AWQ: no rotation.
+        m.make_quant_expansions_init(types.SimpleNamespace(quantization_config={"algo_config": [{"name": "awq"}]}))
         m.moe_attrs["op_type"] = "QMoE"
         m.moe_attrs["expert_weight_bits"] = 4
         m.moe_attrs["swiglu_fusion"] = 1 if ep == "cpu" else 2
-        m.moe_attrs["block_size"] = group_size
         m.shared_input_rotations = {m.hidden_size: torch.randn(m.hidden_size, m.hidden_size)}
         m.shared_rotation_initializers = set()
         return m
