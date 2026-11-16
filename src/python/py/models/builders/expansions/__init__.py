@@ -11,8 +11,8 @@ from .webgpu import WebGPU
 
 __all__ = [
     "DML",
-    "Quark",
     "TRT_RTX",
+    "Quark",
     "Standard",
     "WebGPU",
 ]

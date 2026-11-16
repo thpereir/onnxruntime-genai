@@ -207,7 +207,7 @@ class Model:
         self.make_ep_expansions_init()
 
         # Initialize quantization-library-specific expansions
-        self.make_quant_expansions_init()
+        self.make_quant_expansions_init(config)
 
         # Map all input names, types, and shapes
         self.input_names = {
@@ -573,20 +573,22 @@ class Model:
         else:
             return
 
-    def make_quant_expansions_init(self):
+    def make_quant_expansions_init(self, config):
         """
         Extend the current class with quantization-library-specific subgraph expansions.
 
         Unlike EP expansions, these are keyed on `quant_type` so library-specific graph
-        emission (e.g. Quark's factored input rotation + pre-quantized MoE experts) lives in
-        the `expansions` subfolder instead of the shared base/model classes.
+        emission (e.g. Quark's factored input rotation) lives in the `expansions` subfolder
+        instead of the shared base/model classes. Expansions override model-class methods of
+        the same name.
         """
         if self.quant_type == "quark":
             from .expansions import Quark
+            from .expansions.quark import has_online_rotation
 
-            self.make_factored_rotation = Quark.make_factored_rotation.__get__(self, self.__class__)
-            self.make_moe_quark_input_transform = Quark.make_moe_quark_input_transform.__get__(self, self.__class__)
-            self.make_moe_quark_preprocessing = Quark.make_moe_quark_preprocessing.__get__(self, self.__class__)
+            self.quark_online_rotation = has_online_rotation(config.quantization_config)
+            self.make_matmul_op = Quark.make_matmul_op.__get__(self, self.__class__)
+            self.is_packed_matmul_supported = Quark.is_packed_matmul_supported.__get__(self, self.__class__)
 
     def make_cache_names(self, valid_layer_types, input_format_name):
         """Return cache names for layers whose type is in the valid layer types."""
@@ -844,6 +846,7 @@ class Model:
             not self.matmul_attrs["use_lora"]
             and not self.attention_attrs["q_norm"]
             and not self.attention_attrs["k_norm"]
+            and self.is_packed_matmul_supported()
         )
 
         # Some architectures require a separate RoPE op before PagedAttention.
@@ -3098,31 +3101,6 @@ class Model:
         )
 
     def make_matmul_op(self, matmul, basename, root_input, **kwargs):
-        # Factored online rotation (Quark rotation algo): rotate the activation before the
-        # quantized projection. Weights are stored in the rotated basis, so this is required.
-        # LoRA (below) is applied to the ORIGINAL (pre-rotation) activation, so capture it first.
-        original_root_input = root_input
-        if getattr(matmul, "input_prescale", None) is not None and getattr(self, "shared_input_rotations", None):
-            root_input = self.make_factored_rotation(matmul, basename, root_input, **kwargs)
-
-        matmul_name = self.make_matmul_core(matmul, basename, root_input, **kwargs)
-
-        # Bake the additive PEFT LoRA delta into the graph, if present (never for `logits`,
-        # since the excluded lm_head carries no adapter).
-        if (
-            not kwargs.get("logits", False)
-            and getattr(matmul, "lora_A", None) is not None
-            and getattr(matmul, "lora_B", None) is not None
-        ):
-            return self.make_lora_add(matmul, basename, original_root_input, matmul_name, **kwargs)
-        return matmul_name
-
-    def make_matmul_core(self, matmul, basename, root_input, **kwargs):
-        # Pre-quantized 2-bit weights are emitted as MatMulNBits (ORT runs the float zero-point
-        # 2-bit MatMulNBits on CPU/MLAS). make_matmul_nbits falls back to a float MatMul for any
-        # projection that carries no quantized weight (e.g. the router proj / lm_head).
-        if hasattr(matmul, "qweight") and matmul.qweight is not None and getattr(matmul, "bits", None) == 2:
-            return self.make_matmul_nbits(matmul, basename, root_input, **kwargs)
         if self.onnx_dtype in {ir.DataType.FLOAT16, ir.DataType.BFLOAT16, ir.DataType.FLOAT}:
             return self.make_matmul_float(matmul, basename, root_input, **kwargs)
         elif self.onnx_dtype in {
@@ -3251,32 +3229,6 @@ class Model:
             output, self.io_dtype, shape=self.make_hidden_state_shape(seq_dim=seq_dim, last_dim=out_features)
         )
         return basename
-
-    def make_lora_add(self, matmul, basename, root_input, matmul_name, **kwargs):
-        # Additive PEFT LoRA delta, baked into the graph:
-        #     y = MatMulNBits(rotate(x)) + ((x @ lora_A^T) @ (scaling * lora_B)^T)
-        # lora_A is [rank, in_features], lora_B is [out_features, rank]; both act on the
-        # ORIGINAL (pre-rotation) activation, matching how the adapter was trained. The
-        # `scaling` factor (lora_alpha / r) is pre-baked into the lora_B initializer.
-        seq_dim = kwargs.get("seq_dim", "sequence_length")
-        rank = matmul.lora_A.shape[0]
-        out_features = matmul.lora_B.shape[0]
-
-        lora_A_weight = f"{basename}/lora_A/weight"
-        self.make_initializer(matmul.lora_A.T, lora_A_weight, to=self.io_dtype)
-        lora_A_output = f"{basename}/lora_A/output_0"
-        self.make_node("MatMul", inputs=[root_input, lora_A_weight], outputs=[lora_A_output], name=f"{basename}/lora_A")
-        self.make_value(lora_A_output, self.io_dtype, shape=["batch_size", seq_dim, rank])
-
-        lora_B_weight = f"{basename}/lora_B/weight"
-        self.make_initializer((matmul.lora_B * matmul.lora_scaling).T, lora_B_weight, to=self.io_dtype)
-        lora_B_output = f"{basename}/lora_B/output_0"
-        self.make_node("MatMul", inputs=[lora_A_output, lora_B_weight], outputs=[lora_B_output], name=f"{basename}/lora_B")
-        self.make_value(lora_B_output, self.io_dtype, shape=["batch_size", seq_dim, out_features])
-
-        add_name = f"{basename}/lora/Add"
-        self.make_add(add_name, [f"{matmul_name}/output_0", lora_B_output], dtype=self.io_dtype, shape=["batch_size", seq_dim, out_features])
-        return add_name
 
     def make_matmul_float(self, matmul, name, root_input, **kwargs):
         weight = name[1:].replace("/", ".") + ".weight"
@@ -7043,9 +6995,6 @@ class Model:
             # matrices, emitted once and referenced by every projection of that in_features.
             self.shared_input_rotations = getattr(model, "shared_input_rotations", {}) or {}
             self.shared_rotation_initializers = set()
-            if self.shared_input_rotations:
-                # Each projection applies its own input rotation, so build q/k/v separately.
-                self.attention_attrs["use_packed_matmul"] = False
 
         else:
             extra_kwargs = {}

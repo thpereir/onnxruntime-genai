@@ -150,20 +150,20 @@ def _mock_quark_moe_layer(hidden, num_experts, moe_inter, group_size):
 
 
 class TestGemma4MoEQuarkPath:
-    """Pre-quantized Quark uint2 (2-bit) expert path: make_moe_quark_preprocessing + subgraph."""
+    """Pre-quantized Quark uint2 (2-bit) expert path: the Quark make_moe_preprocessing + subgraph."""
 
     def _make_quark_model(self, ep="cpu", group_size=16):
         m = _make_model(onnx_dtype=ir.DataType.FLOAT)
         # The QuarkModel loader sets these; seed them so the quark path can run standalone.
         m.quant_type = "quark"
         m.ep = ep
+        m.quant_attrs["config"] = {"global_quant_config": {"weight": {"group_size": group_size}}}
         # Bind the Quark expansion methods (real construction does this via
         # make_quant_expansions_init once quant_type is known).
-        m.make_quant_expansions_init()
+        m.make_quant_expansions_init(types.SimpleNamespace(quantization_config={"algo_config": [{"name": "rotation"}]}))
         m.moe_attrs["op_type"] = "QMoE"
         m.moe_attrs["expert_weight_bits"] = 2
         m.moe_attrs["swiglu_fusion"] = 1 if ep == "cpu" else 2
-        m.moe_attrs["block_size"] = group_size
         m.shared_input_rotations = {m.hidden_size: torch.randn(m.hidden_size, m.hidden_size)}
         m.shared_rotation_initializers = set()
         return m
@@ -180,6 +180,25 @@ class TestGemma4MoEQuarkPath:
         router_probs = m.make_moe_router(0, moe, "resid")
         m.make_moe_subgraph(0, moe, "resid", router_probs)
         return layer
+
+    def test_preprocessing_sets_block_size_from_group_size(self):
+        """The Quark expert preprocessing takes the QMoE block size from the checkpoint group size."""
+        m = self._make_quark_model(ep="cpu", group_size=16)
+        self._build_quark_layer(m, group_size=16)
+        assert m.moe_attrs["block_size"] == 16
+
+    def test_online_rotation_disables_packed_qkv(self):
+        """A rotation checkpoint rotates q/k/v inputs separately, so packed Q/K/V is unsupported."""
+        m = self._make_quark_model(ep="cpu")
+        assert m.is_packed_matmul_supported() is False
+
+    def test_without_rotation_packed_qkv_follows_model_class(self):
+        """Without a rotation algorithm the Quark override defers to the model class."""
+        m = _make_model(onnx_dtype=ir.DataType.FLOAT)
+        expected = m.is_packed_matmul_supported()
+        m.quant_type = "quark"
+        m.make_quant_expansions_init(types.SimpleNamespace(quantization_config={"algo_config": [{"name": "awq"}]}))
+        assert m.is_packed_matmul_supported() is expected
 
     def test_qmoe_node_emits_expert_weight_bits_2(self):
         """The fused QMoE op carries expert_weight_bits=2 for the 2-bit Quark path."""

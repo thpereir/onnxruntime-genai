@@ -14,9 +14,9 @@ so that the original Hugging Face --> ONNX code can store the quantized weights 
 ONNX Runtime's format no matter where the quantized weights actually come from.
 """
 
+import json
 import os
 import re
-import json
 
 import torch
 from safetensors.torch import load_file
@@ -1025,7 +1025,7 @@ class QuantizedModel:
             else:
                 # lora_B is split along its output dimension across the targets.
                 start = 0
-                for target, size in zip(targets, out_splits):
+                for target, size in zip(targets, out_splits, strict=True):
                     target.lora_B = tensor[start : start + size, :]
                     target.lora_scaling = scaling
                     start += size

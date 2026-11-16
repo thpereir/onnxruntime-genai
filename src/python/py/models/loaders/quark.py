@@ -171,16 +171,16 @@ class QuarkModel(QuantizedModel):
             W_rot[in,out] = R^T @ (W_orig^T / prescale)   (matches op x_rot=(x*prescale)@R)
         down is plain (no transform). Then per-group asymmetric uint2 quant along `in`.
         """
-        W = proj.qweight.to(torch.float32)      # stored as [out, in] (standard Linear)
-        WT = W.t().contiguous()                 # [in, out]
+        weight = proj.qweight.to(torch.float32)      # stored as [out, in] (standard Linear)
+        weight_t = weight.t().contiguous()                 # [in, out]
         if is_gate_up:
-            R = self.shared_input_rotations[WT.shape[0]].to(torch.float32)   # [in, in]
-            WT = WT / prescale.to(torch.float32).unsqueeze(1)               # scale rows by 1/prescale
-            WT = R.t() @ WT                                                  # [in, out]
+            rotation = self.shared_input_rotations[weight_t.shape[0]].to(torch.float32)   # [in, in]
+            weight_t = weight_t / prescale.to(torch.float32).unsqueeze(1)               # scale rows by 1/prescale
+            weight_t = rotation.t() @ weight_t                                                  # [in, out]
         gs = self.global_group_size
-        in_dim, out_dim = WT.shape
+        in_dim, out_dim = weight_t.shape
         ng = in_dim // gs
-        w = WT.reshape(ng, gs, out_dim)
+        w = weight_t.reshape(ng, gs, out_dim)
         wmin = w.min(dim=1).values              # [ng, out]
         wmax = w.max(dim=1).values
         scale = (wmax - wmin) / 3.0             # 2-bit -> 4 levels (0..3)
